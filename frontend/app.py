@@ -83,20 +83,44 @@ def get_video_capture(input_type: str, connection_string: str):
         return None
 
 
-def send_frame(frame_bytes: bytes):
+def send_frame(frame_bytes: bytes, session_id: Optional[str] = None, frame_number: int = 0, is_first_frame: bool = False):
+    """
+    Send frame to backend for analysis.
+    If session_id is provided, uses contextual endpoint with conversation history.
+    """
     try:
-        files = {"file": ("frame.jpg", frame_bytes, "image/jpeg")}
-        resp = requests.post(f"{BACKEND_URL}/analyze_frame", files=files, timeout=20)
+        if session_id:
+            # Use contextual endpoint with session tracking
+            files = {"file": ("frame.jpg", frame_bytes, "image/jpeg")}
+            data_payload = {
+                "session_id": session_id,
+                "frame_number": frame_number,
+                "is_first_frame": is_first_frame
+            }
+            resp = requests.post(
+                f"{BACKEND_URL}/analyze_frame_contextual",
+                files=files,
+                data=data_payload,
+                timeout=30
+            )
+        else:
+            # Legacy endpoint without context
+            files = {"file": ("frame.jpg", frame_bytes, "image/jpeg")}
+            resp = requests.post(f"{BACKEND_URL}/analyze_frame", files=files, timeout=20)
+        
         if resp.status_code != 200:
-            return {"labels": [], "points": [], "bboxes": []}
+            return {"labels": [], "points": [], "bboxes": [], "objects": []}
+        
         data = resp.json()
         return {
             "labels": data.get("labels", []) or [],
             "points": data.get("points", []) or [],
             "bboxes": data.get("bboxes", []) or [],
+            "objects": data.get("objects", []) or [],
+            "unique_objects_count": data.get("unique_objects_count", 0),
         }
-    except Exception:
-        return {"labels": [], "points": [], "bboxes": []}
+    except Exception as e:
+        return {"labels": [], "points": [], "bboxes": [], "objects": []}
 
 
 @dataclass
@@ -107,6 +131,11 @@ class AnalysisState:
     running: bool = False
     thread: Optional[threading.Thread] = None
     interval_sec: float = 0.3
+    recording: bool = False
+    recorded_objects: dict = field(default_factory=dict)  # {label: count} - OLD method
+    session_id: Optional[str] = None  # Session ID for contextual tracking
+    frame_number: int = 0  # Current frame number in recording session
+    unique_objects: dict = field(default_factory=dict)  # {object_id: {label, first_seen, last_seen}}
 
 
 def _ensure_analysis_state() -> AnalysisState:
@@ -127,12 +156,51 @@ def start_analysis_worker():
         while state.running:
             try:
                 now = time.time()
-                if state.latest_jpg is not None and (now - last_ts) >= max(0.05, state.interval_sec):
+                # Only call API when recording is active
+                if state.recording and state.latest_jpg is not None and (now - last_ts) >= max(0.05, state.interval_sec):
                     t0 = time.time()
-                    result = send_frame(state.latest_jpg)
+                    
+                    # Determine if this is the first frame of the session
+                    is_first = (state.frame_number == 0)
+                    
+                    # Call API with session context
+                    result = send_frame(
+                        state.latest_jpg,
+                        session_id=state.session_id,
+                        frame_number=state.frame_number,
+                        is_first_frame=is_first
+                    )
                     state.last_latency_ms = (time.time() - t0) * 1000.0
                     state.last_result = result
+                    state.frame_number += 1
                     last_ts = now
+                    
+                    # Update unique objects from contextual response
+                    if state.recording and result and isinstance(result, dict):
+                        objects = result.get("objects", [])
+                        for obj in objects:
+                            if isinstance(obj, dict):
+                                obj_id = obj.get("object_id")
+                                label = obj.get("label")
+                                is_new = obj.get("is_new", False)
+                                
+                                if obj_id and label:
+                                    if obj_id not in state.unique_objects:
+                                        state.unique_objects[obj_id] = {
+                                            "label": label,
+                                            "first_seen": state.frame_number,
+                                            "last_seen": state.frame_number,
+                                            "is_new": is_new
+                                        }
+                                    else:
+                                        state.unique_objects[obj_id]["last_seen"] = state.frame_number
+                        
+                        # Also maintain old method for backward compatibility
+                        labels = result.get("labels", [])
+                        for label in labels:
+                            if label and isinstance(label, str):
+                                label_lower = label.lower().strip()
+                                state.recorded_objects[label_lower] = state.recorded_objects.get(label_lower, 0) + 1
             except Exception:
                 pass
             time.sleep(0.005)
@@ -218,12 +286,14 @@ with col_input2:
 
 st.divider()
 
-# Debug and connection status
-col_debug1, col_debug2 = st.columns(2)
-with col_debug1:
+# Control buttons and status
+col_ctrl1, col_ctrl2, col_ctrl3 = st.columns(3)
+with col_ctrl1:
     debug_enabled = st.checkbox("Show debug info", value=False)
-with col_debug2:
+with col_ctrl2:
     status_placeholder = st.empty()
+with col_ctrl3:
+    record_button_placeholder = st.empty()
 
 # Additional info
 with st.expander("ℹ️ Connection Help & Examples"):
@@ -267,6 +337,92 @@ with col_side:
     st.subheader("Labels")
     labels_placeholder = st.empty()
 
+# Recording summary section
+st.divider()
+summary_container = st.container()
+with summary_container:
+    summary_placeholder = st.empty()
+
+# Initialize recording state outside the loop
+if "is_recording" not in st.session_state:
+    st.session_state["is_recording"] = False
+
+# Recording button with callback
+def toggle_recording():
+    import uuid
+    
+    st.session_state["is_recording"] = not st.session_state["is_recording"]
+    state = _ensure_analysis_state()
+    state.recording = st.session_state["is_recording"]
+    
+    if st.session_state["is_recording"]:
+        # Starting new recording - generate session ID
+        state.session_id = str(uuid.uuid4())
+        state.frame_number = 0
+        state.recorded_objects = {}
+        state.unique_objects = {}
+        logger_msg = f"Started recording session: {state.session_id}"
+        print(logger_msg)
+    else:
+        # Stopped recording - cleanup session on backend
+        if state.session_id:
+            try:
+                requests.delete(f"{BACKEND_URL}/session/{state.session_id}", timeout=5)
+            except Exception:
+                pass
+        state.session_id = None
+        state.frame_number = 0
+
+# Show recording button
+if st.session_state.get("is_recording", False):
+    record_button_placeholder.button("⏹️ Stop Recording", on_click=toggle_recording, type="primary", use_container_width=True)
+else:
+    record_button_placeholder.button("🔴 Start Recording", on_click=toggle_recording, use_container_width=True)
+
+# Display recording summary if we just stopped recording and have data
+if not st.session_state.get("is_recording", False):
+    state = _ensure_analysis_state()
+    if state.unique_objects:
+        # Show unique objects tracked via context
+        summary_text = "### 📊 Recording Summary (Context-Aware Tracking)\n\n**Unique Objects Detected:**\n\n"
+        
+        # Group by label
+        label_groups = {}
+        for obj_id, obj_data in state.unique_objects.items():
+            label = obj_data["label"]
+            if label not in label_groups:
+                label_groups[label] = []
+            label_groups[label].append(obj_data)
+        
+        for label, objs in sorted(label_groups.items()):
+            count = len(objs)
+            if count == 1:
+                summary_text += f"- **{label.title()}**: 1 unique instance\n"
+            else:
+                summary_text += f"- **{label.title()}**: {count} unique instances\n"
+        
+        total_unique = len(state.unique_objects)
+        total_appearances = sum(state.recorded_objects.values()) if state.recorded_objects else 0
+        
+        summary_text += f"\n**Summary:**\n"
+        summary_text += f"- Total unique objects: **{total_unique}**\n"
+        if total_appearances > 0:
+            summary_text += f"- Total frame appearances: {total_appearances}\n"
+            summary_text += f"- Deduplication saved: **{total_appearances - total_unique}** duplicate counts!\n"
+        
+        summary_placeholder.success(summary_text)
+    elif state.recorded_objects:
+        # Fallback to old method if contextual tracking didn't work
+        summary_text = "### 📊 Recording Summary (Legacy Mode)\n\n**Objects Detected:**\n\n"
+        sorted_objects = sorted(state.recorded_objects.items(), key=lambda x: x[1], reverse=True)
+        for label, count in sorted_objects:
+            summary_text += f"- **{label.title()}**: {count} appearances\n"
+        summary_text += f"\n**Note**: This shows frame appearances, not unique objects.\n"
+        summary_text += f"**Total detections**: {sum(state.recorded_objects.values())}"
+        summary_placeholder.warning(summary_text)
+    else:
+        summary_placeholder.empty()
+
 run = st.toggle("Start Stream", value=False, key="_toggle_start_webcam")
 
 if run:
@@ -294,7 +450,10 @@ if run:
             state = _ensure_analysis_state()
             
             # Initialize labels display
-            labels_placeholder.write("Waiting for detection...")
+            labels_placeholder.write("Click 'Start Recording' to begin detection...")
+            
+            # Sync session state with analysis state
+            state.recording = st.session_state.get("is_recording", False)
             
             while run:
                 ok, frame = cap.read()
@@ -332,57 +491,81 @@ if run:
                     last_labels = labels
                     last_bboxes = bboxes
                     # Update label display
-                    if labels:
-                        labels_text = "\n".join([f"• {label}" for label in labels])
-                        labels_placeholder.markdown(labels_text)
+                    if state.recording:
+                        if labels:
+                            labels_text = "**🔴 Recording**\n\n"
+                            labels_text += "\n".join([f"• {label}" for label in labels])
+                            labels_placeholder.markdown(labels_text)
+                        else:
+                            labels_placeholder.markdown("**🔴 Recording**\n\nNo labels detected")
                     else:
-                        labels_placeholder.write("No labels detected")
+                        labels_placeholder.write("Click 'Start Recording' to begin detection...")
+                    
+                    # Only update annotated frame when detection results change (not every frame)
+                    # This makes it a "snapshot" of the last analyzed frame
+                    if state.recording and (labels or bboxes):
+                        try:
+                            annotated = rgb.copy()
+                            h, w, _ = annotated.shape
+                            
+                            def denorm_x(x):
+                                return int(max(0, min(w - 1, round((x / 1000.0) * w))))
+                            def denorm_y(y):
+                                return int(max(0, min(h - 1, round((y / 1000.0) * h))))
 
-                # Always render annotated frame (with or without bboxes)
-                try:
-                    annotated = rgb.copy()
-                    h, w, _ = annotated.shape
-                    def denorm_x(x):
-                        return int(max(0, min(w - 1, round((x / 1000.0) * w))))
-                    def denorm_y(y):
-                        return int(max(0, min(h - 1, round((y / 1000.0) * h))))
+                            for idx, bbox in enumerate(bboxes):
+                                if isinstance(bbox, list) and len(bbox) == 4:
+                                    y1, x1, y2, x2 = bbox
+                                    p1 = (denorm_x(x1), denorm_y(y1))
+                                    p2 = (denorm_x(x2), denorm_y(y2))
+                                    cv2.rectangle(annotated, p1, p2, (0, 255, 0), 2)
+                                    if idx < len(labels):
+                                        text = labels[idx]
+                                        # Font scale relative to image height for readability; thicker stroke
+                                        font_scale = max(0.7, min(2.0, h / 480.0))
+                                        cv2.putText(
+                                            annotated,
+                                            text,
+                                            (p1[0], max(0, p1[1] - 8)),
+                                            cv2.FONT_HERSHEY_SIMPLEX,
+                                            font_scale,
+                                            (0, 255, 0),
+                                            2,
+                                        )
+                            # Points intentionally not rendered per requirement
 
-                    for idx, bbox in enumerate(bboxes):
-                        if isinstance(bbox, list) and len(bbox) == 4:
-                            y1, x1, y2, x2 = bbox
-                            p1 = (denorm_x(x1), denorm_y(y1))
-                            p2 = (denorm_x(x2), denorm_y(y2))
-                            cv2.rectangle(annotated, p1, p2, (0, 255, 0), 2)
-                            if idx < len(labels):
-                                text = labels[idx]
-                                # Font scale relative to image height for readability; thicker stroke
-                                font_scale = max(0.7, min(2.0, h / 480.0))
-                                cv2.putText(
-                                    annotated,
-                                    text,
-                                    (p1[0], max(0, p1[1] - 8)),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    font_scale,
-                                    (0, 255, 0),
-                                    2,
-                                )
-                    # Points intentionally not rendered per requirement
-
-                    annotated_placeholder.image(annotated, channels="RGB", use_column_width=True)
-                except Exception as e:
-                    # Show error if rendering fails
-                    annotated_placeholder.error(f"Rendering error: {e}")
+                            # Add timestamp/frame number overlay
+                            timestamp_text = f"Frame: {state.frame_number} | Objects: {len(labels)}"
+                            cv2.putText(
+                                annotated,
+                                timestamp_text,
+                                (10, h - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5,
+                                (255, 255, 255),
+                                1,
+                            )
+                            
+                            annotated_placeholder.image(annotated, channels="RGB", use_column_width=True)
+                        except Exception as e:
+                            # Show error if rendering fails
+                            annotated_placeholder.error(f"Rendering error: {e}")
 
                 run = st.session_state.get("_toggle_start_webcam", run)
                 time.sleep(0.01)
         finally:
             cap.release()
             stop_analysis_worker()
+            # Reset recording state
+            if "is_recording" in st.session_state:
+                st.session_state["is_recording"] = False
+            state.recording = False
             status_placeholder.warning("⏸️ Disconnected")
             sidebar_status.warning("⏸️ Disconnected")
 else:
     st.caption("Idle - Select input type and click 'Start Stream'")
     status_placeholder.info("⏸️ Ready to connect")
     sidebar_status.info("⏸️ Ready")
+    summary_placeholder.empty()
 
 
